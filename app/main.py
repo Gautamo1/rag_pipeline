@@ -214,6 +214,48 @@ def _build_temp_retriever(file_path: Path):
     return retriever, chunks
 
 
+
+def _direct_extract(text: str, question: str) -> str | None:
+    """
+    For key:value style questions, try direct regex extraction first
+    before hitting the LLM. Handles insurance/policy documents reliably.
+    """
+    import re
+    q = question.lower().strip().rstrip('?.').strip()
+
+    # Map common question patterns to regex patterns on the document text
+    patterns = {
+        'certificate no':       r'(?:Policy\s*/\s*Certificate\s*No|Certificate\s*No)[^\w]*([A-Z0-9]+)',
+        'policy no':            r'(?:Policy\s*/\s*Certificate\s*No|Policy\s*No)[^\w]*([A-Z0-9]+)',
+        'policy number':        r'(?:Policy\s*/\s*Certificate\s*No|Policy\s*Number)[^\w]*([A-Z0-9]+)',
+        'intermediary name':    r'Intermediary\s*Name[^\w]*([\w\s]+(?:Pvt\.?\s*Ltd\.?|Ltd\.?|Inc\.?|LLP)?)',
+        'intermediary code':    r'Intermediary\s*Code[^\w]*([A-Z0-9]+)',
+        'policy holder':        r'Policy\s*Holder\s*Name[^\w]*([\w\s.]+)',
+        'insured name':         r'(?:Insured\s*Name|Name)[^\w]*(Mrs?\.?\s*[\w\s]+)',
+        'policy issue date':    r'Policy\s*Issue\s*Date[^\w]*(\d{2}/\d{2}/\d{4})',
+        'policy start date':    r'Policy\s*Start\s*Date[^\w]*(\d{2}/\d{2}/\d{4})',
+        'policy end date':      r'Policy\s*End\s*Date[^\w]*(\d{2}/\d{2}/\d{4})',
+        'premium':              r'(?:FINAL\s*PREMIUM|Policy\s*premium\s*including\s*Tax)[^\w]*(\d[\d,.]+)',
+        'registration number':  r'Registration\s*Number[^\w]*([A-Z]{2}\s*\d+\s*[A-Z]+\s*\d+)',
+        'vehicle make':         r'Vehicle\s*Make[^\w]*([\w\s]+)',
+        'engine number':        r'Engine\s*(?:Number|No)[^\w]*([A-Z0-9]+)',
+        'chassis number':       r'Chassis\s*(?:Number|No)[^\w]*([A-Z0-9]+)',
+        'contact':              r'Contact\s*No[^\w]*(\d{10})',
+        'email':                r'Email\s*(?:Id|Address)?[^\w]*([\w.]+@[\w.]+)',
+        'address':              r'Address[^\w]*([\w\s,.-]+(?:Punjab|Delhi|Mumbai|Bangalore|Chennai|Hyderabad|Kolkata)[\w\s,.-]*\d{6})',
+        'gst':                  r'GST[^\w]*(\d[\d,.]+)',
+        'receipt number':       r'Receipt\s*Number[^\w]*([A-Z0-9]+)',
+    }
+
+    for key, pattern in patterns.items():
+        if key in q:
+            m = re.search(pattern, text, re.IGNORECASE)
+            if m:
+                return m.group(1).strip()
+
+    return None
+
+
 # ── Endpoints ────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -242,6 +284,18 @@ def query(req: QueryRequest):
         for question in req.questions:
             if not question.strip():
                 continue
+            # Try direct extraction first for key:value questions
+            full_text = " ".join(c["text"] for c in chunks)
+            direct = _direct_extract(full_text, question)
+            if direct:
+                results.append(QuestionAnswer(
+                    question=question,
+                    answer=direct,
+                    sources=[chunks[0]["source"] if chunks else "document"],
+                ))
+                logger.success(f"  Q (direct): {question[:70]}")
+                continue
+
             retrieved = retriever.retrieve(question, top_k=top_k)
             if not retrieved:
                 results.append(QuestionAnswer(
@@ -336,6 +390,17 @@ async def query_file(
         for question in question_list:
             if not question.strip():
                 continue
+            full_text = " ".join(c["text"] for c in chunks)
+            direct = _direct_extract(full_text, question)
+            if direct:
+                results.append(QuestionAnswer(
+                    question=question,
+                    answer=direct,
+                    sources=[chunks[0]["source"] if chunks else "document"],
+                ))
+                logger.success(f"  Q (direct): {question[:70]}")
+                continue
+
             retrieved = retriever.retrieve(question, top_k=TOP_K)
             if not retrieved:
                 results.append(QuestionAnswer(
