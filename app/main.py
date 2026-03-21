@@ -9,6 +9,7 @@ Endpoints:
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import tempfile
 import urllib.request
@@ -58,11 +59,7 @@ async def lifespan(app: FastAPI):
     DOCS_DIR.mkdir(parents=True, exist_ok=True)
     INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    state.retriever = Retriever(
-        model_name=EMBED_MODEL,
-        index_path=INDEX_PATH,
-        chunks_path=CHUNKS_PATH,
-    )
+    state.retriever = Retriever(model_name=EMBED_MODEL)
     state.generator = Generator(
         model_name=GENERATOR_MODEL,
         torch_dtype=TORCH_DTYPE,
@@ -88,17 +85,8 @@ app = FastAPI(
 # ── Schemas ──────────────────────────────────────────────────────
 
 class QueryRequest(BaseModel):
-    url: str = Field(
-        ...,
-        description="Publicly accessible URL to a PDF, DOCX, TXT, or MD file",
-        examples=["https://example.com/hr_policy.pdf"]
-    )
-    questions: list[str] = Field(
-        ...,
-        min_length=1,
-        description="One or more questions to answer from the document",
-        examples=[["What is the remote work policy?", "How many leave days do contractors get?"]]
-    )
+    url: str = Field(..., description="URL to a PDF, DOCX, TXT, or MD file. Google Drive share links are supported.")
+    questions: list[str] = Field(..., min_length=1, description="One or more questions to answer from the document")
     top_k: Optional[int] = Field(None, ge=1, le=20, description="Chunks to retrieve per question (default: 8)")
 
 class QuestionAnswer(BaseModel):
@@ -120,36 +108,83 @@ class IndexStats(BaseModel):
 
 # ── Helpers ──────────────────────────────────────────────────────
 
+def _gdrive_direct_url(url: str) -> str:
+    """Convert any Google Drive sharing URL to a direct download URL."""
+    # handles /file/d/<id>/view and ?id=<id> formats
+    m = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url)
+    if not m:
+        m = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", url)
+    if m:
+        file_id = m.group(1)
+        return f"https://drive.google.com/uc?export=download&id={file_id}"
+    return url
+
+
 def _download_file(url: str, dest_dir: Path) -> Path:
-    """Download a file from a URL into dest_dir, return local path."""
-    parsed = urlparse(url)
-    filename = Path(parsed.path).name or "document"
+    """Download a file from URL into dest_dir. Handles Google Drive links."""
 
-    # Ensure extension is supported
-    suffix = Path(filename).suffix.lower()
-    if suffix not in SUPPORTED_EXTS:
-        raise HTTPException(
-            400,
-            f"Unsupported file type '{suffix}'. Supported: {', '.join(SUPPORTED_EXTS)}"
-        )
+    # Rewrite Google Drive share links → direct download
+    if "drive.google.com" in url:
+        url = _gdrive_direct_url(url)
+        logger.info(f"Resolved Google Drive URL → {url}")
 
-    dest = dest_dir / filename
     try:
-        logger.info(f"Downloading {url}")
-        urllib.request.urlretrieve(url, dest)
-        logger.success(f"Downloaded → {dest} ({dest.stat().st_size // 1024} KB)")
+        request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(request) as response:
+
+            # 1. Try Content-Disposition header (most reliable)
+            filename = ""
+            cd = response.headers.get("Content-Disposition", "")
+            if cd:
+                m = re.search(r'filename[^;=\n]*=([\'"]?)([^\'";\n]+)\1', cd, re.IGNORECASE)
+                if m:
+                    filename = m.group(2).strip()
+
+            # 2. Fall back to URL path
+            if not filename:
+                filename = Path(urlparse(url).path).name or "document"
+
+            # 3. If extension still missing, guess from Content-Type
+            if not Path(filename).suffix:
+                ct = response.headers.get("Content-Type", "")
+                ext_map = {
+                    "application/pdf": ".pdf",
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+                    "text/plain": ".txt",
+                    "text/markdown": ".md",
+                }
+                for mime, ext in ext_map.items():
+                    if mime in ct:
+                        filename += ext
+                        break
+
+            suffix = Path(filename).suffix.lower()
+            if suffix not in SUPPORTED_EXTS:
+                raise HTTPException(
+                    400,
+                    f"Unsupported file type '{suffix}'. Supported: {', '.join(SUPPORTED_EXTS)}"
+                )
+
+            dest = dest_dir / filename
+            with open(dest, "wb") as f:
+                shutil.copyfileobj(response, f)
+
+        logger.success(f"Downloaded '{filename}' ({dest.stat().st_size // 1024} KB)")
+
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(400, f"Could not download file from URL: {e}")
+        raise HTTPException(400, f"Could not download file: {e}")
+
     return dest
 
 
-def _build_temp_index(file_path: Path):
-    """Ingest a single file and return a fresh Retriever with its index."""
-    from app.ingestion import ingest_directory, save_chunks
+def _build_temp_retriever(file_path: Path):
+    """Ingest a single file and return an in-memory Retriever."""
+    from app.ingestion import ingest_directory
     from app.retriever import Retriever
 
-    tmp_docs = file_path.parent
-    chunks = ingest_directory(tmp_docs, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
+    chunks = ingest_directory(file_path.parent, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
     if not chunks:
         raise HTTPException(422, "No text could be extracted from the document.")
 
@@ -162,10 +197,7 @@ def _build_temp_index(file_path: Path):
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "generator_loaded": state.generator is not None,
-    }
+    return {"status": "ok", "generator_loaded": state.generator is not None}
 
 
 @app.get("/index/stats", response_model=IndexStats)
@@ -173,11 +205,7 @@ def index_stats():
     if state.retriever is None or state.retriever.index is None:
         return IndexStats(total_chunks=0, sources=[], index_exists=False)
     sources = sorted({c["source"] for c in state.retriever.chunks})
-    return IndexStats(
-        total_chunks=len(state.retriever.chunks),
-        sources=sources,
-        index_exists=True,
-    )
+    return IndexStats(total_chunks=len(state.retriever.chunks), sources=sources, index_exists=True)
 
 
 @app.post("/query", response_model=QueryResponse)
@@ -186,13 +214,16 @@ def query(req: QueryRequest):
     Download a policy document from a URL, index it on the fly,
     then answer every question in the list.
 
-    Example request body:
+    Supports:
+    - Direct file URLs (.pdf, .docx, .txt, .md)
+    - Google Drive share links (automatically converted)
+
+    Example:
     {
-      "url": "https://example.com/hr_policy.pdf",
+      "url": "https://drive.google.com/file/d/YOUR_FILE_ID/view?usp=sharing",
       "questions": [
         "What is the remote work policy?",
-        "How many sick days are employees entitled to?",
-        "What are the IT security requirements?"
+        "How many sick days are employees entitled to?"
       ]
     }
     """
@@ -201,11 +232,11 @@ def query(req: QueryRequest):
     with tempfile.TemporaryDirectory() as tmp:
         tmp_dir = Path(tmp)
 
-        # 1. Download
+        # 1. Download file (handles Google Drive links)
         file_path = _download_file(req.url, tmp_dir)
 
-        # 2. Ingest + index (in-memory, not saved to disk)
-        retriever, chunks = _build_temp_index(file_path)
+        # 2. Ingest + build in-memory index
+        retriever, chunks = _build_temp_retriever(file_path)
 
         # 3. Answer each question
         results: list[QuestionAnswer] = []
@@ -230,7 +261,7 @@ def query(req: QueryRequest):
                 answer=answer,
                 sources=list({c["source"] for c in retrieved}),
             ))
-            logger.success(f"  Q: {question[:60]}…")
+            logger.success(f"  Q: {question[:70]}")
 
     return QueryResponse(
         url=req.url,
@@ -242,23 +273,16 @@ def query(req: QueryRequest):
 
 @app.post("/ingest", summary="Upload documents and persist them in the permanent index")
 async def ingest(files: list[UploadFile] = File(...)):
-    """
-    Alternative to /query: upload docs to the permanent index.
-    Useful when you want to keep a document available across requests
-    without re-downloading it each time.
-    """
     from app.ingestion import ingest_directory, save_chunks
     from app.retriever import Retriever
 
     if not files:
         raise HTTPException(400, "No files provided")
 
-    saved = []
     for upload in files:
         dest = DOCS_DIR / upload.filename
         with dest.open("wb") as f:
             shutil.copyfileobj(upload.file, f)
-        saved.append(upload.filename)
 
     chunks = ingest_directory(DOCS_DIR, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
     if not chunks:
@@ -270,18 +294,9 @@ async def ingest(files: list[UploadFile] = File(...)):
     new_retriever.save(INDEX_PATH, CHUNKS_PATH)
     state.retriever = new_retriever
 
-    return {
-        "message": "Index rebuilt",
-        "uploaded": saved,
-        "total_chunks": len(chunks),
-    }
+    return {"message": "Index rebuilt", "total_chunks": len(chunks)}
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "app.main:app",
-        host=os.getenv("API_HOST", "0.0.0.0"),
-        port=int(os.getenv("API_PORT", "8000")),
-        reload=False,
-    )
+    uvicorn.run("app.main:app", host=os.getenv("API_HOST", "0.0.0.0"), port=int(os.getenv("API_PORT", "8000")))
