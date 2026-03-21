@@ -126,12 +126,21 @@ def _download_file(url: str, dest_dir: Path) -> Path:
     raw = dest_dir / "download.tmp"
     ct_header, cd_header = "", ""
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            ct_header = resp.headers.get("Content-Type", "").lower()
-            cd_header = resp.headers.get("Content-Disposition", "")
-            with open(raw, "wb") as f:
-                shutil.copyfileobj(resp, f)
+        import requests
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/pdf,*/*",
+        })
+        resp = session.get(url, timeout=30, allow_redirects=True, stream=True)
+        resp.raise_for_status()
+        ct_header = resp.headers.get("Content-Type", "").lower()
+        cd_header = resp.headers.get("Content-Disposition", "")
+        with open(raw, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                f.write(chunk)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(400, f"Could not download file: {e}")
 
