@@ -1,7 +1,5 @@
 """
 ingestion.py — Load PDF / DOCX / TXT / MD → clean text chunks
-Chunks are split on section boundaries so headings stay glued
-to their content (fixes career objective, skills, etc. sections).
 """
 from __future__ import annotations
 
@@ -20,9 +18,8 @@ def _load_pdf(path: Path) -> str:
     pages = []
     for page in reader.pages:
         text = page.extract_text() or ""
-        # pypdf sometimes joins words without spaces — fix common patterns
-        text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)       # camelCase split
-        text = re.sub(r"([.!?])([A-Z])", r"\1 \2", text)        # missing space after sentence
+        text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
+        text = re.sub(r"([.!?])([A-Z])", r"\1 \2", text)
         pages.append(text)
     return "\n".join(pages)
 
@@ -58,50 +55,14 @@ def load_document(path: Path) -> str:
 # ── Cleaning ─────────────────────────────────────────────────────
 
 def clean_text(text: str) -> str:
-    text = re.sub(r"\x00", "", text)               # null bytes
-    text = re.sub(r"\r\n", "\n", text)             # normalise line endings
-    text = re.sub(r"[ \t]+", " ", text)            # collapse spaces/tabs
-    text = re.sub(r"\n{3,}", "\n\n", text)         # max 2 blank lines
+    text = re.sub(r"\x00", "", text)
+    text = re.sub(r"\r\n", "\n", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
-# ── Section-aware chunking ────────────────────────────────────────
-
-# Matches typical resume / policy document section headings:
-# ALL CAPS lines, or Title Case lines that are short (< 6 words) and
-# followed by a newline — e.g. "Career Objective", "SKILLS", "Education"
-SECTION_HEADING_RE = re.compile(
-    r"(?m)^[ \t]*("
-    r"[A-Z][A-Z\s]{2,40}"           # ALL CAPS heading
-    r"|(?:[A-Z][a-z]+\s*){1,5}"     # Title Case short heading
-    r"):?\s*$"
-)
-
-
-def _split_into_sections(text: str) -> list[tuple[str, str]]:
-    """
-    Split text into (heading, body) pairs.
-    If no headings found, returns [("", full_text)].
-    """
-    matches = list(SECTION_HEADING_RE.finditer(text))
-    if not matches:
-        return [("", text)]
-
-    sections = []
-    for i, match in enumerate(matches):
-        heading = match.group(0).strip()
-        start = match.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        body = text[start:end].strip()
-        sections.append((heading, body))
-
-    # Text before first heading (name, contact info, etc.)
-    preamble = text[:matches[0].start()].strip()
-    if preamble:
-        sections.insert(0, ("", preamble))
-
-    return sections
-
+# ── Chunking ─────────────────────────────────────────────────────
 
 def chunk_text(
     text: str,
@@ -109,57 +70,48 @@ def chunk_text(
     overlap: int = 64,
 ) -> list[str]:
     """
-    Section-aware chunking:
-    1. Split on section headings first — heading stays glued to its content.
-    2. If a section body exceeds chunk_size words, sub-split on sentences.
-    3. Small sections (< 30 words) are merged with the next section to avoid
-       orphan chunks like a lone heading with no content.
+    Sliding-window word chunker that splits on paragraph boundaries first,
+    then falls back to sentence boundaries.
+
+    Keeps adjacent lines together so key:value fields (Certificate No,
+    Intermediary Name, etc.) stay in the same chunk as their values.
     """
-    sections = _split_into_sections(text)
-    raw_chunks: list[str] = []
+    # Split into paragraphs (double newline = paragraph break)
+    paragraphs = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
 
-    for heading, body in sections:
-        # Combine heading + body as one unit
-        full = (f"{heading}\n{body}").strip() if heading else body
-        words = full.split()
+    chunks: list[str] = []
+    current_words: list[str] = []
+    current_len = 0
 
-        if len(words) <= chunk_size:
-            raw_chunks.append(full)
-        else:
-            # Sub-split long sections on sentence boundaries
-            sentences = re.split(r"(?<=[.!?])\s+", full)
-            current: list[str] = []
-            current_len = 0
+    for para in paragraphs:
+        para_words = para.split()
 
+        # If adding this paragraph exceeds chunk_size, flush current buffer
+        if current_len + len(para_words) > chunk_size and current_words:
+            chunks.append(" ".join(current_words))
+            # Keep overlap from end of current buffer
+            current_words = current_words[-overlap:] if overlap else []
+            current_len = len(current_words)
+
+        # If a single paragraph is itself larger than chunk_size, split by sentence
+        if len(para_words) > chunk_size:
+            sentences = re.split(r"(?<=[.!?])\s+", para)
             for sent in sentences:
                 sent_words = sent.split()
-                if current_len + len(sent_words) > chunk_size and current:
-                    raw_chunks.append(" ".join(current))
-                    current = current[-overlap:] if overlap else []
-                    current_len = len(current)
-                current.extend(sent_words)
+                if current_len + len(sent_words) > chunk_size and current_words:
+                    chunks.append(" ".join(current_words))
+                    current_words = current_words[-overlap:] if overlap else []
+                    current_len = len(current_words)
+                current_words.extend(sent_words)
                 current_len += len(sent_words)
-
-            if current:
-                raw_chunks.append(" ".join(current))
-
-    # Merge tiny orphan chunks into the next one
-    merged: list[str] = []
-    carry = ""
-    for chunk in raw_chunks:
-        combined = (carry + " " + chunk).strip() if carry else chunk
-        if len(combined.split()) < 30 and chunk != raw_chunks[-1]:
-            carry = combined   # too small — carry forward and merge with next
         else:
-            merged.append(combined)
-            carry = ""
-    if carry:
-        if merged:
-            merged[-1] = (merged[-1] + " " + carry).strip()
-        else:
-            merged.append(carry)
+            current_words.extend(para_words)
+            current_len += len(para_words)
 
-    return [c for c in merged if len(c.strip()) > 20]
+    if current_words:
+        chunks.append(" ".join(current_words))
+
+    return [c for c in chunks if len(c.strip()) > 20]
 
 
 # ── Pipeline ─────────────────────────────────────────────────────
