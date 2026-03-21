@@ -1,10 +1,5 @@
 """
 main.py — FastAPI RAG service
-Endpoints:
-  POST /query           — pass a file URL + list of questions, get answers for all
-  POST /ingest          — upload documents directly, rebuild index
-  GET  /health          — liveness check
-  GET  /index/stats     — chunks / sources in the index
 """
 from __future__ import annotations
 
@@ -85,7 +80,7 @@ app = FastAPI(
 # ── Schemas ──────────────────────────────────────────────────────
 
 class QueryRequest(BaseModel):
-    url: str = Field(..., description="URL to a PDF, DOCX, TXT, or MD file. Google Drive share links are supported.")
+    url: str = Field(..., description="URL to a PDF, DOCX, TXT, or MD file. Google Drive share links supported.")
     questions: list[str] = Field(..., min_length=1, description="One or more questions to answer from the document")
     top_k: Optional[int] = Field(None, ge=1, le=20, description="Chunks to retrieve per question (default: 8)")
 
@@ -109,78 +104,95 @@ class IndexStats(BaseModel):
 # ── Helpers ──────────────────────────────────────────────────────
 
 def _gdrive_direct_url(url: str) -> str:
-    """Convert any Google Drive sharing URL to a direct download URL."""
-    # handles /file/d/<id>/view and ?id=<id> formats
     m = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url)
     if not m:
         m = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", url)
     if m:
-        file_id = m.group(1)
-        return f"https://drive.google.com/uc?export=download&id={file_id}"
+        return f"https://drive.google.com/uc?export=download&confirm=t&id={m.group(1)}"
     return url
 
 
 def _download_file(url: str, dest_dir: Path) -> Path:
-    """Download a file from URL into dest_dir. Handles Google Drive links."""
-
-    # Rewrite Google Drive share links → direct download
+    """
+    Always download first, then detect type from magic bytes.
+    Never rejects based on URL — works for extensionless URLs
+    like SBI, insurance portals, Drive links, etc.
+    """
     if "drive.google.com" in url:
         url = _gdrive_direct_url(url)
         logger.info(f"Resolved Google Drive URL → {url}")
 
+    # ── Step 1: download to a raw temp file ──────────────────────
+    raw = dest_dir / "download.tmp"
+    ct_header, cd_header = "", ""
     try:
-        request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(request) as response:
-
-            # 1. Try Content-Disposition header (most reliable)
-            filename = ""
-            cd = response.headers.get("Content-Disposition", "")
-            if cd:
-                m = re.search(r'filename[^;=\n]*=([\'"]?)([^\'";\n]+)\1', cd, re.IGNORECASE)
-                if m:
-                    filename = m.group(2).strip()
-
-            # 2. Fall back to URL path
-            if not filename:
-                filename = Path(urlparse(url).path).name or "document"
-
-            # 3. If extension still missing, guess from Content-Type
-            if not Path(filename).suffix:
-                ct = response.headers.get("Content-Type", "")
-                ext_map = {
-                    "application/pdf": ".pdf",
-                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
-                    "text/plain": ".txt",
-                    "text/markdown": ".md",
-                }
-                for mime, ext in ext_map.items():
-                    if mime in ct:
-                        filename += ext
-                        break
-
-            suffix = Path(filename).suffix.lower()
-            if suffix not in SUPPORTED_EXTS:
-                raise HTTPException(
-                    400,
-                    f"Unsupported file type '{suffix}'. Supported: {', '.join(SUPPORTED_EXTS)}"
-                )
-
-            dest = dest_dir / filename
-            with open(dest, "wb") as f:
-                shutil.copyfileobj(response, f)
-
-        logger.success(f"Downloaded '{filename}' ({dest.stat().st_size // 1024} KB)")
-
-    except HTTPException:
-        raise
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            ct_header = resp.headers.get("Content-Type", "").lower()
+            cd_header = resp.headers.get("Content-Disposition", "")
+            with open(raw, "wb") as f:
+                shutil.copyfileobj(resp, f)
     except Exception as e:
         raise HTTPException(400, f"Could not download file: {e}")
 
+    size_kb = raw.stat().st_size // 1024
+    snippet  = raw.read_bytes()[:16]
+
+    # ── Step 2: reject HTML error pages ──────────────────────────
+    if b"<html" in snippet.lower() or b"<!doct" in snippet.lower():
+        raise HTTPException(
+            400,
+            "Server returned an HTML page instead of a file. "
+            "If using Google Drive, share as 'Anyone with the link'."
+        )
+
+    # ── Step 3: determine extension ──────────────────────────────
+    # Priority: magic bytes > Content-Type > Content-Disposition > URL path
+
+    magic_map = [
+        (b"%PDF",                 ".pdf"),
+        (b"PK\x03\x04",          ".docx"),
+        (b"\xd0\xcf\x11\xe0",    ".doc"),
+    ]
+    ext = ""
+    for magic, candidate in magic_map:
+        if snippet.startswith(magic):
+            ext = candidate
+            break
+
+    if not ext:
+        ct_map = {
+            "application/pdf":   ".pdf",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+            "application/msword": ".doc",
+            "text/plain":        ".txt",
+            "text/markdown":     ".md",
+        }
+        for mime, candidate in ct_map.items():
+            if mime in ct_header:
+                ext = candidate
+                break
+
+    if not ext and cd_header:
+        m = re.search(r'filename[^;=\n]*=[\'"]?([^\'";\n]+)', cd_header, re.IGNORECASE)
+        if m:
+            ext = Path(m.group(1).strip()).suffix.lower()
+
+    if not ext:
+        ext = Path(urlparse(url).path).suffix.lower()
+
+    if not ext:
+        ext = ".pdf"
+        logger.warning("Could not detect file type — defaulting to .pdf")
+
+    # ── Step 4: rename to final path ─────────────────────────────
+    dest = raw.with_name("document" + ext)
+    raw.rename(dest)
+    logger.success(f"Downloaded → {dest.name} ({size_kb} KB)")
     return dest
 
 
 def _build_temp_retriever(file_path: Path):
-    """Ingest a single file and return an in-memory Retriever."""
     from app.ingestion import ingest_directory
     from app.retriever import Retriever
 
@@ -210,40 +222,17 @@ def index_stats():
 
 @app.post("/query", response_model=QueryResponse)
 def query(req: QueryRequest):
-    """
-    Download a policy document from a URL, index it on the fly,
-    then answer every question in the list.
-
-    Supports:
-    - Direct file URLs (.pdf, .docx, .txt, .md)
-    - Google Drive share links (automatically converted)
-
-    Example:
-    {
-      "url": "https://drive.google.com/file/d/YOUR_FILE_ID/view?usp=sharing",
-      "questions": [
-        "What is the remote work policy?",
-        "How many sick days are employees entitled to?"
-      ]
-    }
-    """
     top_k = req.top_k or TOP_K
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_dir = Path(tmp)
-
-        # 1. Download file (handles Google Drive links)
         file_path = _download_file(req.url, tmp_dir)
-
-        # 2. Ingest + build in-memory index
         retriever, chunks = _build_temp_retriever(file_path)
 
-        # 3. Answer each question
         results: list[QuestionAnswer] = []
         for question in req.questions:
             if not question.strip():
                 continue
-
             retrieved = retriever.retrieve(question, top_k=top_k)
             if not retrieved:
                 results.append(QuestionAnswer(
@@ -252,10 +241,8 @@ def query(req: QueryRequest):
                     sources=[],
                 ))
                 continue
-
             prompt = state.generator.build_prompt(question, retrieved)
             answer = state.generator.generate(prompt)
-
             results.append(QuestionAnswer(
                 question=question,
                 answer=answer,
@@ -271,7 +258,7 @@ def query(req: QueryRequest):
     )
 
 
-@app.post("/ingest", summary="Upload documents and persist them in the permanent index")
+@app.post("/ingest")
 async def ingest(files: list[UploadFile] = File(...)):
     from app.ingestion import ingest_directory, save_chunks
     from app.retriever import Retriever
@@ -293,7 +280,6 @@ async def ingest(files: list[UploadFile] = File(...)):
     new_retriever.build_index(chunks)
     new_retriever.save(INDEX_PATH, CHUNKS_PATH)
     state.retriever = new_retriever
-
     return {"message": "Index rebuilt", "total_chunks": len(chunks)}
 
 
