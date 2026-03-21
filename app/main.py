@@ -1,44 +1,47 @@
 """
 main.py — FastAPI RAG service
 Endpoints:
-  POST /ingest          — upload documents, re-build index
-  POST /query           — ask a question, get an answer
+  POST /query           — pass a file URL + list of questions, get answers for all
+  POST /ingest          — upload documents directly, rebuild index
   GET  /health          — liveness check
-  GET  /index/stats     — how many chunks / sources in the index
+  GET  /index/stats     — chunks / sources in the index
 """
 from __future__ import annotations
 
 import os
 import shutil
 import tempfile
+import urllib.request
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
 from loguru import logger
 from pydantic import BaseModel, Field
 
 load_dotenv()
 
-# ── Config from .env ─────────────────────────────────────────────
 GENERATOR_MODEL = os.getenv("GENERATOR_MODEL", "Gautamo1/mistral-7b-rag-reader")
-EMBED_MODEL      = os.getenv("EMBED_MODEL",     "BAAI/bge-small-en-v1.5")
+EMBED_MODEL      = os.getenv("EMBED_MODEL",     "BAAI/bge-base-en-v1.5")
 DEVICE_MAP       = os.getenv("DEVICE_MAP",      "auto")
 TORCH_DTYPE      = os.getenv("TORCH_DTYPE",     "bfloat16")
-CHUNK_SIZE       = int(os.getenv("CHUNK_SIZE",  "512"))
+CHUNK_SIZE       = int(os.getenv("CHUNK_SIZE",   "512"))
 CHUNK_OVERLAP    = int(os.getenv("CHUNK_OVERLAP","64"))
-TOP_K            = int(os.getenv("TOP_K",       "5"))
-INDEX_PATH       = Path(os.getenv("INDEX_PATH", "data/index/faiss.index"))
-CHUNKS_PATH      = Path(os.getenv("CHUNKS_PATH","data/index/chunks.json"))
+TOP_K            = int(os.getenv("TOP_K",        "8"))
+INDEX_PATH       = Path(os.getenv("INDEX_PATH",  "data/index/faiss.index"))
+CHUNKS_PATH      = Path(os.getenv("CHUNKS_PATH", "data/index/chunks.json"))
 DOCS_DIR         = Path("data/docs")
-MAX_NEW_TOKENS   = int(os.getenv("MAX_NEW_TOKENS", "512"))
-TEMPERATURE      = float(os.getenv("TEMPERATURE",  "0.1"))
-DO_SAMPLE        = os.getenv("DO_SAMPLE", "false").lower() == "true"
+MAX_NEW_TOKENS   = int(os.getenv("MAX_NEW_TOKENS","512"))
+TEMPERATURE      = float(os.getenv("TEMPERATURE", "0.1"))
+DO_SAMPLE        = os.getenv("DO_SAMPLE","false").lower() == "true"
+COMPILE_MODEL    = os.getenv("COMPILE_MODEL","true").lower() == "true"
 
-# ── App state ────────────────────────────────────────────────────
+SUPPORTED_EXTS = {".pdf", ".docx", ".doc", ".txt", ".md"}
+
+
 class AppState:
     retriever = None
     generator = None
@@ -48,7 +51,6 @@ state = AppState()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load models on startup."""
     from app.retriever import Retriever
     from app.generator import Generator
 
@@ -61,7 +63,6 @@ async def lifespan(app: FastAPI):
         index_path=INDEX_PATH,
         chunks_path=CHUNKS_PATH,
     )
-
     state.generator = Generator(
         model_name=GENERATOR_MODEL,
         torch_dtype=TORCH_DTYPE,
@@ -69,6 +70,7 @@ async def lifespan(app: FastAPI):
         max_new_tokens=MAX_NEW_TOKENS,
         temperature=TEMPERATURE,
         do_sample=DO_SAMPLE,
+        compile_model=COMPILE_MODEL,
     )
     logger.info("── Service ready ──")
     yield
@@ -77,8 +79,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Policy RAG API",
-    description="Retrieval-Augmented Generation over policy documents",
-    version="1.0.0",
+    description="Pass a document URL and a list of questions — get answers grounded in that document.",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -86,19 +88,29 @@ app = FastAPI(
 # ── Schemas ──────────────────────────────────────────────────────
 
 class QueryRequest(BaseModel):
-    question: str = Field(..., min_length=3, description="Natural-language question")
-    top_k: Optional[int] = Field(None, ge=1, le=20, description="Override default top-k")
+    url: str = Field(
+        ...,
+        description="Publicly accessible URL to a PDF, DOCX, TXT, or MD file",
+        examples=["https://example.com/hr_policy.pdf"]
+    )
+    questions: list[str] = Field(
+        ...,
+        min_length=1,
+        description="One or more questions to answer from the document",
+        examples=[["What is the remote work policy?", "How many leave days do contractors get?"]]
+    )
+    top_k: Optional[int] = Field(None, ge=1, le=20, description="Chunks to retrieve per question (default: 8)")
 
-class SourceChunk(BaseModel):
-    source: str
-    chunk_id: int
-    score: float
-    text: str
-
-class QueryResponse(BaseModel):
+class QuestionAnswer(BaseModel):
     question: str
     answer: str
-    sources: list[SourceChunk]
+    sources: list[str]
+
+class QueryResponse(BaseModel):
+    url: str
+    filename: str
+    total_chunks_indexed: int
+    results: list[QuestionAnswer]
 
 class IndexStats(BaseModel):
     total_chunks: int
@@ -106,15 +118,53 @@ class IndexStats(BaseModel):
     index_exists: bool
 
 
+# ── Helpers ──────────────────────────────────────────────────────
+
+def _download_file(url: str, dest_dir: Path) -> Path:
+    """Download a file from a URL into dest_dir, return local path."""
+    parsed = urlparse(url)
+    filename = Path(parsed.path).name or "document"
+
+    # Ensure extension is supported
+    suffix = Path(filename).suffix.lower()
+    if suffix not in SUPPORTED_EXTS:
+        raise HTTPException(
+            400,
+            f"Unsupported file type '{suffix}'. Supported: {', '.join(SUPPORTED_EXTS)}"
+        )
+
+    dest = dest_dir / filename
+    try:
+        logger.info(f"Downloading {url}")
+        urllib.request.urlretrieve(url, dest)
+        logger.success(f"Downloaded → {dest} ({dest.stat().st_size // 1024} KB)")
+    except Exception as e:
+        raise HTTPException(400, f"Could not download file from URL: {e}")
+    return dest
+
+
+def _build_temp_index(file_path: Path):
+    """Ingest a single file and return a fresh Retriever with its index."""
+    from app.ingestion import ingest_directory, save_chunks
+    from app.retriever import Retriever
+
+    tmp_docs = file_path.parent
+    chunks = ingest_directory(tmp_docs, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
+    if not chunks:
+        raise HTTPException(422, "No text could be extracted from the document.")
+
+    retriever = Retriever(model_name=EMBED_MODEL)
+    retriever.build_index(chunks)
+    return retriever, chunks
+
+
 # ── Endpoints ────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
-    index_ready = state.retriever is not None and state.retriever.index is not None
     return {
         "status": "ok",
-        "index_ready": index_ready,
-        "chunks": len(state.retriever.chunks) if index_ready else 0,
+        "generator_loaded": state.generator is not None,
     }
 
 
@@ -130,12 +180,72 @@ def index_stats():
     )
 
 
-@app.post("/ingest", summary="Upload documents and rebuild the index")
+@app.post("/query", response_model=QueryResponse)
+def query(req: QueryRequest):
+    """
+    Download a policy document from a URL, index it on the fly,
+    then answer every question in the list.
+
+    Example request body:
+    {
+      "url": "https://example.com/hr_policy.pdf",
+      "questions": [
+        "What is the remote work policy?",
+        "How many sick days are employees entitled to?",
+        "What are the IT security requirements?"
+      ]
+    }
+    """
+    top_k = req.top_k or TOP_K
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+
+        # 1. Download
+        file_path = _download_file(req.url, tmp_dir)
+
+        # 2. Ingest + index (in-memory, not saved to disk)
+        retriever, chunks = _build_temp_index(file_path)
+
+        # 3. Answer each question
+        results: list[QuestionAnswer] = []
+        for question in req.questions:
+            if not question.strip():
+                continue
+
+            retrieved = retriever.retrieve(question, top_k=top_k)
+            if not retrieved:
+                results.append(QuestionAnswer(
+                    question=question,
+                    answer="No relevant content found in the document.",
+                    sources=[],
+                ))
+                continue
+
+            prompt = state.generator.build_prompt(question, retrieved)
+            answer = state.generator.generate(prompt)
+
+            results.append(QuestionAnswer(
+                question=question,
+                answer=answer,
+                sources=list({c["source"] for c in retrieved}),
+            ))
+            logger.success(f"  Q: {question[:60]}…")
+
+    return QueryResponse(
+        url=req.url,
+        filename=file_path.name,
+        total_chunks_indexed=len(chunks),
+        results=results,
+    )
+
+
+@app.post("/ingest", summary="Upload documents and persist them in the permanent index")
 async def ingest(files: list[UploadFile] = File(...)):
     """
-    Upload one or more policy documents (PDF, DOCX, TXT, MD).
-    The index is rebuilt from all documents currently in data/docs/
-    plus anything newly uploaded here.
+    Alternative to /query: upload docs to the permanent index.
+    Useful when you want to keep a document available across requests
+    without re-downloading it each time.
     """
     from app.ingestion import ingest_directory, save_chunks
     from app.retriever import Retriever
@@ -143,74 +253,30 @@ async def ingest(files: list[UploadFile] = File(...)):
     if not files:
         raise HTTPException(400, "No files provided")
 
-    saved_names = []
+    saved = []
     for upload in files:
         dest = DOCS_DIR / upload.filename
         with dest.open("wb") as f:
             shutil.copyfileobj(upload.file, f)
-        saved_names.append(upload.filename)
-        logger.info(f"Saved upload: {upload.filename}")
+        saved.append(upload.filename)
 
-    # Re-ingest entire docs dir
     chunks = ingest_directory(DOCS_DIR, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
     if not chunks:
-        raise HTTPException(422, "No text could be extracted from the uploaded files.")
+        raise HTTPException(422, "No text could be extracted.")
 
     save_chunks(chunks, CHUNKS_PATH)
-
-    # Rebuild FAISS index (replace in-memory state)
     new_retriever = Retriever(model_name=EMBED_MODEL)
     new_retriever.build_index(chunks)
     new_retriever.save(INDEX_PATH, CHUNKS_PATH)
     state.retriever = new_retriever
 
     return {
-        "message": "Index rebuilt successfully",
-        "uploaded": saved_names,
+        "message": "Index rebuilt",
+        "uploaded": saved,
         "total_chunks": len(chunks),
-        "total_sources": len({c["source"] for c in chunks}),
     }
 
 
-@app.post("/query", response_model=QueryResponse)
-def query(req: QueryRequest):
-    """
-    Ask a question over the ingested policy documents.
-    Returns the answer and the source chunks used.
-    """
-    if state.retriever is None or state.retriever.index is None:
-        raise HTTPException(503, "Index not ready. POST to /ingest first.")
-
-    top_k = req.top_k or TOP_K
-
-    # 1. Retrieve relevant chunks
-    chunks = state.retriever.retrieve(req.question, top_k=top_k)
-    if not chunks:
-        raise HTTPException(404, "No relevant chunks found in the index.")
-
-    # 2. Build prompt
-    prompt = state.generator.build_prompt(req.question, chunks)
-
-    # 3. Generate answer
-    logger.info(f"Generating answer for: {req.question!r}")
-    answer = state.generator.generate(prompt)
-
-    return QueryResponse(
-        question=req.question,
-        answer=answer,
-        sources=[
-            SourceChunk(
-                source=c["source"],
-                chunk_id=c["chunk_id"],
-                score=round(c["score"], 4),
-                text=c["text"][:300] + ("…" if len(c["text"]) > 300 else ""),
-            )
-            for c in chunks
-        ],
-    )
-
-
-# ── Dev runner ───────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
