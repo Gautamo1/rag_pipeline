@@ -1,13 +1,12 @@
-# Core ML — install the ROCm build of PyTorch separately (see README)
+# torch is pre-installed in the ROCm container — do NOT reinstall it here
+# PyTorch 2.9 dev + ROCm 7.0 is already present
+
 transformers>=4.40.0
 accelerate>=0.27.0
 sentence-transformers>=2.7.0
-faiss-gpu>=1.8.0        # GPU-accelerated FAISS (ROCm build available via pip)
 
-# Flash Attention 2 — required for attn_implementation="flash_attention_2"
-# Install from source for ROCm: pip install flash-attn --no-build-isolation
-# (listed here as a reminder; wheels aren't on PyPI for ROCm)
-# flash-attn>=2.5.0
+# faiss-gpu has no ROCm wheel — cpu build is plenty fast for retrieval
+faiss-cpu>=1.8.0
 
 # Document ingestion
 pypdf>=4.0.0
