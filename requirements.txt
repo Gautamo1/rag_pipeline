@@ -1,0 +1,26 @@
+# Core ML — install the ROCm build of PyTorch separately (see README)
+transformers>=4.40.0
+accelerate>=0.27.0
+sentence-transformers>=2.7.0
+faiss-gpu>=1.8.0        # GPU-accelerated FAISS (ROCm build available via pip)
+
+# Flash Attention 2 — required for attn_implementation="flash_attention_2"
+# Install from source for ROCm: pip install flash-attn --no-build-isolation
+# (listed here as a reminder; wheels aren't on PyPI for ROCm)
+# flash-attn>=2.5.0
+
+# Document ingestion
+pypdf>=4.0.0
+python-docx>=1.1.0
+
+# API
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
+
+# Utilities
+pydantic>=2.7.0
+tqdm>=4.66.0
+loguru>=0.7.2
+python-dotenv>=1.0.0
+numpy>=1.26.0

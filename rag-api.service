@@ -1,0 +1,25 @@
+[Unit]
+Description=Policy RAG API
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/rag_pipeline
+EnvironmentFile=/home/ubuntu/rag_pipeline/.env
+ExecStart=/home/ubuntu/rag_pipeline/venv/bin/python -m uvicorn app.main:app \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --workers 1 \
+    --log-level info
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rag-api
+
+# Give the model time to load on startup
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
