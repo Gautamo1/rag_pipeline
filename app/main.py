@@ -244,6 +244,12 @@ def _direct_extract(text: str, question: str) -> str | None:
         'email':                r'Email\s*(?:Id|Address)?[^\w]*([\w.]+@[\w.]+)',
         'address':              r'Address[^\w]*([\w\s,.-]+(?:Punjab|Delhi|Mumbai|Bangalore|Chennai|Hyderabad|Kolkata)[\w\s,.-]*\d{6})',
         'gst':                  r'GST[^\w]*(\d[\d,.]+)',
+        'period of insurance tp': r'Period of Insurance TP[^\w]*From:?\s*([\d/: ]+To:[\d/: ]+)',
+        'period of insurance':    r'Period of Insurance TP[^\w]*From:?\s*([\d/: ]+To:[\d/: ]+)',
+        'period':                 r'Period of Insurance TP[^\w]*From:?\s*([\d/: ]+To:[\d/: ]+)',
+        'name':                   r'(?:Insured Name|Policy Holder Name|Name)[^\w]*(Mrs?\.?\s*[\w\s]+)',
+        'customer id':            r'Customer ID[^\w]*([\w]+)',
+        'branch':                 r'Policy Servicing Branch[^\w]*([\w\s]+)',
         'receipt number':       r'Receipt\s*Number[^\w]*([A-Z0-9]+)',
     }
 
@@ -306,9 +312,16 @@ def query(req: QueryRequest):
                 continue
             prompt = state.generator.build_prompt(question, retrieved)
             answer = state.generator.generate(prompt)
+            # Truncate runaway answers and strip repetition
+            answer = answer[:500].strip()
+            # Detect and cut repetitive loops (same phrase repeated 3+ times)
+            import re as _re
+            rep = _re.search(r'(.{20,}?)\1{2,}', answer)
+            if rep:
+                answer = answer[:rep.start()].strip()
             results.append(QuestionAnswer(
                 question=question,
-                answer=answer,
+                answer=answer or "Could not extract a clear answer from the document.",
                 sources=list({c["source"] for c in retrieved}),
             ))
             logger.success(f"  Q: {question[:70]}")
@@ -411,9 +424,16 @@ async def query_file(
                 continue
             prompt = state.generator.build_prompt(question, retrieved)
             answer = state.generator.generate(prompt)
+            # Truncate runaway answers and strip repetition
+            answer = answer[:500].strip()
+            # Detect and cut repetitive loops (same phrase repeated 3+ times)
+            import re as _re
+            rep = _re.search(r'(.{20,}?)\1{2,}', answer)
+            if rep:
+                answer = answer[:rep.start()].strip()
             results.append(QuestionAnswer(
                 question=question,
-                answer=answer,
+                answer=answer or "Could not extract a clear answer from the document.",
                 sources=list({c["source"] for c in retrieved}),
             ))
             logger.success(f"  Q: {question[:70]}")
