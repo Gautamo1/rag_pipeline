@@ -295,3 +295,67 @@ async def ingest(files: list[UploadFile] = File(...)):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app.main:app", host=os.getenv("API_HOST", "0.0.0.0"), port=int(os.getenv("API_PORT", "8000")))
+
+
+@app.post("/query-file", response_model=QueryResponse)
+async def query_file(
+    file: UploadFile = File(...),
+    questions: str = "",
+):
+    """
+    Upload a file directly + questions as a JSON array string.
+    Use this when the URL requires login or JS (SBI, insurance portals, etc.)
+
+    curl -X POST http://localhost:8000/query-file \
+      -F "file=@certificate.pdf" \
+      -F 'questions=["What is Certificate No.", "Whose policy is this"]'
+    """
+    import json
+
+    try:
+        question_list = json.loads(questions)
+        if not isinstance(question_list, list) or not question_list:
+            raise ValueError
+    except Exception:
+        raise HTTPException(400, 'questions must be a JSON array e.g. ["What is X?", "What is Y?"]')
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        suffix = Path(file.filename).suffix.lower() or ".pdf"
+        dest = tmp_dir / ("document" + suffix)
+        with open(dest, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+
+        snippet = dest.read_bytes()[:8]
+        if b"<html" in snippet.lower():
+            raise HTTPException(400, "Uploaded file appears to be HTML, not a document.")
+
+        retriever, chunks = _build_temp_retriever(dest)
+
+        results: list[QuestionAnswer] = []
+        for question in question_list:
+            if not question.strip():
+                continue
+            retrieved = retriever.retrieve(question, top_k=TOP_K)
+            if not retrieved:
+                results.append(QuestionAnswer(
+                    question=question,
+                    answer="No relevant content found in the document.",
+                    sources=[],
+                ))
+                continue
+            prompt = state.generator.build_prompt(question, retrieved)
+            answer = state.generator.generate(prompt)
+            results.append(QuestionAnswer(
+                question=question,
+                answer=answer,
+                sources=list({c["source"] for c in retrieved}),
+            ))
+            logger.success(f"  Q: {question[:70]}")
+
+    return QueryResponse(
+        url=f"upload://{file.filename}",
+        filename=file.filename,
+        total_chunks_indexed=len(chunks),
+        results=results,
+    )
