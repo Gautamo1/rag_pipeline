@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from loguru import logger
 from pydantic import BaseModel, Field
+from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv()
 
@@ -76,6 +77,13 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],  # Vite dev server
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ── Schemas ──────────────────────────────────────────────────────
 
