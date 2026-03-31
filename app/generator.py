@@ -25,6 +25,7 @@ class Generator:
         temperature: float = 0.1,
         do_sample: bool = False,
         compile_model: bool = True,
+        attn_impl: str = "eager",
     ):
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -42,11 +43,12 @@ class Generator:
         self.tokenizer.padding_side = "left"
 
         logger.info(f"Loading model: {model_name}")
+        logger.info(f"Using attention implementation: {attn_impl}")
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=dtype,
             device_map=device_map,
-            attn_implementation="flash_attention_2",
+            attn_implementation=attn_impl,
         )
         self.model.eval()
 

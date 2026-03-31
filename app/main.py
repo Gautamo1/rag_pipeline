@@ -25,6 +25,7 @@ GENERATOR_MODEL = os.getenv("GENERATOR_MODEL", "Gautamo1/mistral-7b-rag-reader")
 EMBED_MODEL      = os.getenv("EMBED_MODEL",     "BAAI/bge-base-en-v1.5")
 DEVICE_MAP       = os.getenv("DEVICE_MAP",      "auto")
 TORCH_DTYPE      = os.getenv("TORCH_DTYPE",     "bfloat16")
+ATTN_IMPL        = os.getenv("ATTN_IMPL",       "eager")  # eager works everywhere; flash_attention_2 for ROCm
 CHUNK_SIZE       = int(os.getenv("CHUNK_SIZE",   "512"))
 CHUNK_OVERLAP    = int(os.getenv("CHUNK_OVERLAP","64"))
 TOP_K            = int(os.getenv("TOP_K",        "8"))
@@ -64,6 +65,7 @@ async def lifespan(app: FastAPI):
         temperature=TEMPERATURE,
         do_sample=DO_SAMPLE,
         compile_model=COMPILE_MODEL,
+        attn_impl=ATTN_IMPL,
     )
     logger.info("── Service ready ──")
     yield
