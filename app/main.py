@@ -18,6 +18,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from loguru import logger
 from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 load_dotenv()
 
@@ -454,3 +455,7 @@ async def query_file(
         total_chunks_indexed=len(chunks),
         results=results,
     )
+
+
+
+app.mount("/", StaticFiles(directory="frontend/dist", html=True), name="static")

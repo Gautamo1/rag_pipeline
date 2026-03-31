@@ -1,19 +1,35 @@
-# @babel/code-frame
+# Policy RAG Frontend (React)
 
-> Generate errors that contain a code frame that point to source locations.
+Minimal React UI with:
 
-See our website [@babel/code-frame](https://babeljs.io/docs/babel-code-frame) for more information.
+- Upload button (interactive styling)
+- Chat-like interface to ask policy questions
+- Works **even if backend is offline** (offline/mock mode)
 
-## Install
+## Run (frontend only)
 
-Using npm:
-
-```sh
-npm install --save-dev @babel/code-frame
+```bash
+cd rag_pipeline/frontend
+npm install
+npm run dev
 ```
 
-or using yarn:
+Open: http://localhost:5173
 
-```sh
-yarn add @babel/code-frame --dev
+## Run with backend
+
+1. Start the API (in a separate terminal):
+
+```bash
+cd rag_pipeline
+uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
+
+2. Keep frontend running (`npm run dev`).
+
+The frontend uses a dev proxy so it can call the API at `/api/*` without CORS changes.
+
+## Notes
+
+- When the backend is reachable, questions are sent to `POST /query-file`.
+- When it is not reachable, the app answers in **Offline mode**. For `.txt` / `.md` files it does a basic keyword search locally.
